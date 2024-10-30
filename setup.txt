@@ -1,0 +1,257 @@
+To set up two Docker clusters managed by a lightweight Kubernetes (K3s) on Ubuntu 24.04 VMs with Istio for encrypted traffic
+
+Prerequisites
+
+    Two Ubuntu 24.04 VMs with at least 2 CPUs, 4GB RAM, and 20GB storage each.
+    Root or sudo access to both VMs.
+    Internet access on both VMs for installing necessary components.
+
+Step 1: Install Docker
+
+Install Docker on both VMs:
+
+sudo apt update
+sudo apt install -y docker.io
+sudo systemctl enable docker --now
+
+Verify Docker is running:
+
+docker --version
+
+Step 2: Install K3s as Kubernetes (Lightweight Kubernetes)
+
+    On both VMs, install K3s. K3s is a lightweight Kubernetes distribution optimized for resource-constrained environments, ideal for embedded systems.
+
+curl -sfL https://get.k3s.io | sh -
+
+Verify that K3s is running:
+
+kubectl get nodes
+
+Obtain the K3s Token from the server node, which will be required to add other nodes to the cluster:
+
+sudo cat /var/lib/rancher/k3s/server/node-token
+
+Copy the token and use it when adding the second node.
+
+On the second VM, join it to the K3s cluster by replacing <server_ip> with the IP address of the primary K3s node:
+
+    curl -sfL https://get.k3s.io | K3S_URL=https://<server_ip>:6443 K3S_TOKEN=<token> sh -
+
+Step 3: Install and Configure Istio
+
+    Download and install Istio on the primary node:
+
+    bash
+
+curl -L https://istio.io/downloadIstio | sh -
+cd istio-*
+export PATH=$PWD/bin:$PATH
+
+Deploy Istio using the istioctl tool with default profile (includes core Istio components and ingress):
+
+sudo ./istioctl install --set profile=default -y --kubeconfig=/etc/rancher/k3s/k3s.yaml
+
+Enable Automatic Sidecar Injection on the default namespace:
+
+    kubectl label namespace default istio-injection=enabled
+
+Step 4: Deploy Example Application with Istio Configuration
+
+To demonstrate encrypted traffic, deploy an example application like the httpbin app:
+
+    Create a configuration file (httpbin.yaml) for the application and Istio gateway:
+
+mkdir ~/istio-configs
+cd ~/istio-configs
+
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpbin
+  labels:
+    app: httpbin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: httpbin
+  template:
+    metadata:
+      labels:
+        app: httpbin
+    spec:
+      containers:
+      - image: kennethreitz/httpbin
+        name: httpbin
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpbin
+spec:
+  ports:
+  - port: 80
+    name: http
+  selector:
+    app: httpbin
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: httpbin-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: httpbin-credential
+    hosts:
+    - "*"
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: httpbin
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - httpbin-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: httpbin
+        port:
+          number: 80
+
+
+ Generate Self-Signed Certificates:
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout httpbin.key -out httpbin.crt -subj "/CN=httpbin/O=httpbin"
+
+Create a Kubernetes Secret for the TLS Certificates
+
+sudo kubectl create -n istio-system secret tls httpbin-credential --key=httpbin.key --cert=httpbin.crt
+
+Deploy the application:
+
+kubectl apply -f httpbin.yaml
+
+Verify that Istio is routing traffic over HTTPS. You can now access the application from the Host VM via the IP address of your ingress gateway:
+
+bash
+
+    kubectl get svc -n istio-system istio-ingressgateway
+
+    Use the external IP of the ingress gateway for HTTPS access.
+
+Seeing <pending> under EXTERNAL-IP indicates that the environment doesn’t have a cloud load balancer provider to automatically assign an external IP. This is typical for local or on-premises setups where a LoadBalancer-type service cannot dynamically get an IP. Here is a work around:
+
+Use NodePort for External Access
+
+Change the istio-ingressgateway service to use NodePort instead of LoadBalancer. This will expose the service on each node’s IP on a specified port.
+
+    Edit the istio-ingressgateway service to change the type from LoadBalancer to NodePort:
+
+sudo kubectl edit svc -n istio-system istio-ingressgateway
+
+Modify this section in the YAML file:
+
+spec:
+  type: NodePort
+
+Save and exit.
+
+Get the updated service information:
+
+sudo kubectl get svc -n istio-system istio-ingressgateway
+
+You should now see NodePort values for ports 80 and 443. For example:
+
+sudo kubectl get svc -n istio-system istio-ingressgateway
+NAME                   TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)                                      AGE
+istio-ingressgateway   NodePort   10.43.170.94   <none>        15021:30773/TCP,80:31278/TCP,443:31708/TCP   14m
+
+Access the service externally by using the IP of any node in your cluster and the NodePort for HTTPS (443:31708 in this example):
+
+https://<node-ip>:31708
+
+To get the node IPs:
+sudo kubectl get nodes -o wide
+NAME       STATUS   ROLES                  AGE   VERSION        INTERNAL-IP    EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION     CONTAINER-RUNTIME
+ubuntu-a   Ready    control-plane,master   28m   v1.30.6+k3s1   192.168.1.87   <none>        Ubuntu 24.04.1 LTS   6.8.0-47-generic   containerd://1.7.22-k3s1
+ubuntu-b   Ready    <none>                 18m   v1.30.6+k3s1   192.168.1.77   <none>        Ubuntu 24.04.1 LTS   6.8.0-47-generic   containerd://1.7.22-k3s1
+
+
+Step 5: Testing Encrypted External Access
+
+On your Host VM, test access by using curl with the -k flag to ignore self-signed certificates for this setup:
+
+curl -k https://<external_ip_of_ingress_gateway>
+
+Additional Configuration Files
+
+    Docker Configuration: /etc/docker/daemon.json can be configured on each node if further customization is required.
+    K3s Config: Located at /etc/rancher/k3s/k3s.yaml.
+
+Let me know if you'd like further customization or additional security settings for this setup.
+You said:
+how do you know what the external ip of ingress gateway is?
+ChatGPT said:
+ChatGPT
+
+To determine the external IP of the Istio ingress gateway, you can use kubectl to check the istio-ingressgateway service in the istio-system namespace. Here’s the exact command to run:
+
+bash
+
+kubectl get svc -n istio-system istio-ingressgateway
+
+The output should look something like this:
+
+scss
+
+NAME                   TYPE           CLUSTER-IP     EXTERNAL-IP      PORT(S)                                      AGE
+istio-ingressgateway   LoadBalancer   10.0.0.1       192.168.1.100    80:31380/TCP,443:31390/TCP                   5m
+
+In this example:
+
+    EXTERNAL-IP is 192.168.1.100, which is the IP you would use for external access.
+
+If you see <pending> under the EXTERNAL-IP column, it usually means your environment doesn’t automatically assign external IPs (for example, a local setup without a load balancer provider). In such cases, you have a couple of options:
+
+    Port-Forwarding: Use kubectl port-forward to access the gateway:
+
+    bash
+
+kubectl port-forward -n istio-system svc/istio-ingressgateway 8443:443
+
+Then, you can access the service locally on https://localhost:8443.
+
+NodePort Option: Modify the istio-ingressgateway service to use a NodePort, which exposes it on each node’s IP at a static port.
+
+bash
+
+kubectl edit svc -n istio-system istio-ingressgateway
+
+Change the type from LoadBalancer to NodePort. You’ll then access the service via <node_ip>:<node_port>.
+
+
+
+
+
+
+
+
